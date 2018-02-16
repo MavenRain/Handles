@@ -143,7 +143,8 @@ int wmain(int argc, WCHAR * argv[])
     AutoHandle processHandle(OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid));
     if (! processHandle)
     {
-        printf("Could not open PID %d! (Don't try to open a system process.)\n", pid);
+        DWORD lastError(::GetLastError());
+        printf(" Could not open PID %d!\nLast Error: %d", pid, lastError);
         return 1;
     }
 
