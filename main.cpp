@@ -8,14 +8,6 @@
 #include <stdio.h>
 #include <memory>
 
-#define NT_SUCCESS(x) ((x) >= 0)
-#define STATUS_INFO_LENGTH_MISMATCH 0xc0000004
-
-#define SystemHandleInformation 16
-#define ObjectBasicInformation 0
-#define ObjectNameInformation 1
-#define ObjectTypeInformation 2
-
 typedef NTSTATUS (NTAPI * _NtQuerySystemInformation)(
     ULONG SystemInformationClass,
     PVOID SystemInformation,
@@ -117,6 +109,99 @@ struct Box
     ~Box() { free(item); }
 };
 
+class ProcessInformation
+{
+    void * process;
+    void * processDuplicate;
+    SYSTEM_HANDLE_INFORMATION * handleInformation;
+    OBJECT_TYPE_INFORMATION * typeInformation;
+    void * nameInformation;
+public:
+    ProcessInformation(unsigned long pid, unsigned long handleInformationSize, unsigned long typeInformationSize, unsigned long nameInformationSize)
+    : process(OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid))
+    , processDuplicate(NULL)
+    , handleInformation(static_cast<SYSTEM_HANDLE_INFORMATION *>(malloc(handleInformationSize)))
+    , typeInformation(static_cast<OBJECT_TYPE_INFORMATION *>(malloc(typeInformationSize)))
+    , nameInformation(malloc(nameInformationSize))
+    {}
+    void * Process() { return process; }
+    void * & ProcessDuplicate() { return processDuplicate; }
+    SYSTEM_HANDLE_INFORMATION * & HandleInformation() { return handleInformation; }
+    OBJECT_TYPE_INFORMATION * & TypeInformation() { return typeInformation; }
+    void * NameInformation() { return nameInformation; }
+    void * * AddressOf(HANDLE value) { return & value; }
+    template<typename T, typename TPrime>
+    TPrime To(T item) { return reinterpret_cast<TPrime>(item); }
+    void Resize(unsigned long size) { handleInformation = static_cast<SYSTEM_HANDLE_INFORMATION *>(realloc(handleInformation, size)); }
+    ~ProcessInformation()
+    {
+        free(nameInformation);
+        free(typeInformation);
+        free(handleInformation);
+        if (processDuplicate) CloseHandle(processDuplicate);
+        if (process) CloseHandle(process);
+    }
+};
+template<typename T>
+struct Result
+{
+    bool success;
+    T result;
+    __int64 error;
+    Result(T _result) : success(true), result(_result){}
+    Result(__int64 _error) : success(false), error(_error){}
+    Result(const Result & _result) : success(_result.success), result(_result.result), error(_result.error){}
+    ~Result(){}
+    T Ok() { return result; }
+    __int64 Error() { return error; }
+};
+
+static _NtQuerySystemInformation NtQuerySystemInformation(static_cast<_NtQuerySystemInformation>(GetLibraryProcAddress("ntdll.dll", "NtQuerySystemInformation")));
+static _NtDuplicateObject NtDuplicateObject(static_cast<_NtDuplicateObject>(GetLibraryProcAddress("ntdll.dll", "NtDuplicateObject")));
+static _NtQueryObject NtQueryObject(static_cast<_NtQueryObject>(GetLibraryProcAddress("ntdll.dll", "NtQueryObject")));
+
+Result<ProcessInformation> & GetSystemInformation(Result<ProcessInformation> & processInformation, unsigned long handleInformationSize)
+{
+    if (! processInformation.success) return processInformation;
+    const int systemHandleInformation(16);
+    long status(0);
+    ProcessInformation processInfo(processInformation.Ok());
+    while(1)
+    {
+        status = NtQuerySystemInformation(systemHandleInformation, processInfo.HandleInformation(), handleInformationSize, NULL);
+        if (status != 0xc0000004) break;
+        processInfo.Resize(handleInformationSize * 2);
+        handleInformationSize *= 2;
+    }
+    return processInformation;
+}
+
+Result<ProcessInformation> & DuplicateHandle(Result<ProcessInformation> & processInformation, void * systemHandle)
+{
+    if (! processInformation.success) return processInformation;
+    ProcessInformation processInfo(processInformation.Ok());
+    long status(NtDuplicateObject(processInfo.Process(), systemHandle, GetCurrentProcess(), & processInfo.ProcessDuplicate(), 0, 0, 0) < 0);
+    return status < 0 ? Result<ProcessInformation>(status) : processInformation;
+}
+
+Result<ProcessInformation> & GetTypeInformation(Result<ProcessInformation> & processInformation, unsigned long typeInformationSize)
+{
+    if (! processInformation.success) return processInformation;
+    ProcessInformation processInfo(processInformation.Ok());
+    const int objectTypeInformation(2);
+    long status(NtQueryObject(processInfo.ProcessDuplicate(), objectTypeInformation, processInfo.TypeInformation(), typeInformationSize, NULL));
+    return status < 0 ? Result<ProcessInformation>(status) : processInformation;
+}
+
+Result<ProcessInformation> & GetNameInformation(Result<ProcessInformation> & processInformation, unsigned long nameInformationSize)
+{
+    if (! processInformation.success) return processInformation;
+    ProcessInformation processInfo(processInformation.Ok());
+    const int objectNameInformation(1);
+    long status(NtQueryObject(processInfo.ProcessDuplicate(), objectNameInformation, processInfo.TypeInformation(), nameInformationSize, NULL));
+    return status < 0 ? Result<ProcessInformation>(status) : processInformation;
+}
+
 int wmain(int argc, WCHAR * argv[])
 {
     struct AutoHandle
@@ -127,11 +212,7 @@ int wmain(int argc, WCHAR * argv[])
         HANDLE * Reference() { return & handle; }
         ~AutoHandle() { CloseHandle(handle); }
     };
-    _NtQuerySystemInformation NtQuerySystemInformation(static_cast<_NtQuerySystemInformation>(GetLibraryProcAddress("ntdll.dll", "NtQuerySystemInformation")));
-    _NtDuplicateObject NtDuplicateObject(static_cast<_NtDuplicateObject>(GetLibraryProcAddress("ntdll.dll", "NtDuplicateObject")));
-    _NtQueryObject NtQueryObject(static_cast<_NtQueryObject>(GetLibraryProcAddress("ntdll.dll", "NtQueryObject")));
-    NTSTATUS status;
-    ULONG handleInfoSize(0x10000);
+    unsigned long handleInfoSize(0x10000);
 
     if (argc < 2)
     {
@@ -139,7 +220,7 @@ int wmain(int argc, WCHAR * argv[])
         return 1;
     }
 
-    ULONG pid(_wtoi(argv[1]));
+    unsigned long pid(_wtoi(argv[1]));
     AutoHandle processHandle(OpenProcess(PROCESS_DUP_HANDLE, FALSE, pid));
     if (! processHandle)
     {
@@ -150,38 +231,37 @@ int wmain(int argc, WCHAR * argv[])
 
     Box<SYSTEM_HANDLE_INFORMATION> handleInfo(handleInfoSize);
 
-    /* NtQuerySystemInformation won't give us the correct buffer size, 
-       so we guess by doubling the buffer size. */
-    while ((status = NtQuerySystemInformation(
-        SystemHandleInformation,
-        handleInfo,
-        handleInfoSize,
-        NULL
-        )) == STATUS_INFO_LENGTH_MISMATCH)
-    {
-        handleInfo.Resize(handleInfoSize * 2);
-        handleInfoSize *= 2;
-    }
-
-    /* NtQuerySystemInformation stopped giving us STATUS_INFO_LENGTH_MISMATCH. */
-    if (! NT_SUCCESS(status))
-    {
-        printf("NtQuerySystemInformation failed!\n");
-        return 1;
-    }
+    // NtQuerySystemInformation won't give us the correct buffer size,
+    // so we guess by doubling the buffer size.
+    //const int systemHandleInformation(16);
+    //long status(0);
+    //while(1)
+    //{
+    //    status = NtQuerySystemInformation(systemHandleInformation, handleInfo, handleInfoSize, NULL);
+    //    if (status != 0xc0000004) break;
+    //    handleInfo.Resize(handleInfoSize * 2);
+    //    handleInfoSize *= 2;
+    //}
+    //
+    //if (status < 0)
+    //{
+    //    printf("NtQuerySystemInformation failed!\n");
+    //    return 1;
+    //}
+    ProcessInformation processInformation(pid, 0x10000, 0x1000, 0x1000);
+    Result<ProcessInformation> systemInformation(GetSystemInformation(Result<ProcessInformation>(processInformation), 0x10000));
     for (ULONG i(0); i < handleInfo->HandleCount; ++ i)
     {
         SYSTEM_HANDLE handle(handleInfo->Handles[i]);
         AutoHandle dupHandle(NULL);
         UNICODE_STRING objectName;
-        ULONG returnLength;
+        unsigned long returnLength(0);
 
-        /* Check if this handle belongs to the PID the user specified. */
-        if (handle.ProcessId != pid)
-            continue;
+        // Check if this handle belongs to the PID the user specified.
+        if (handle.ProcessId != pid) continue;
 
-        /* Duplicate the handle so we can query it. */
-        if (! NT_SUCCESS(NtDuplicateObject(
+        // Duplicate the handle so we can query it.
+        if (NtDuplicateObject(
             processHandle,
             reinterpret_cast<HANDLE>(handle.Handle),
             GetCurrentProcess(),
@@ -189,31 +269,29 @@ int wmain(int argc, WCHAR * argv[])
             0,
             0,
             0
-            )))
+            ) < 0)
         {
             printf("[%#x] Error!\n", handle.Handle);
             continue;
         }
-
-        /* Query the object type. */
         Box<OBJECT_TYPE_INFORMATION> objectTypeInfo(0x1000);
-        if (! NT_SUCCESS(NtQueryObject(
+        const int objectTypeInformation(2);
+        if (NtQueryObject(
             dupHandle,
-            ObjectTypeInformation,
+            objectTypeInformation,
             objectTypeInfo,
             0x1000,
             NULL
-            )))
+            ) < 0)
         {
             printf("[%#x] Error!\n", handle.Handle);
             continue;
         }
 
-        /* Query the object name (unless it has an access of 
-           0x0012019f or 0x00120089, on which NtQueryObject could hang. */
-        if (handle.GrantedAccess == 0x0012019f || handle.GrantedAccess == 0x120089)
+        // NtQueryObject hangs on certain Access Masks
+        if (handle.GrantedAccess == 0x0012019f || handle.GrantedAccess == 0x120089 || handle.GrantedAccess == 0x120189)
         {
-            /* We have the type, so display that. */
+            // We have the type, so display that.
             printf(
                 "[%#x] %.*S: (did not get name)\n",
                 handle.Handle,
@@ -224,25 +302,26 @@ int wmain(int argc, WCHAR * argv[])
         }
 
         Box<void> objectNameInfo(0x1000);
-        if (! NT_SUCCESS(NtQueryObject(
+        const int objectNameInformation(1);
+        if (NtQueryObject(
             dupHandle,
-            ObjectNameInformation,
+            objectNameInformation,
             objectNameInfo,
             0x1000,
             & returnLength
-            )))
+            ) < 0)
         {
-            /* Reallocate the buffer and try again. */
+            // Reallocate the buffer and try again.
             objectNameInfo.Resize(returnLength);
-            if (! NT_SUCCESS(NtQueryObject(
+            if (NtQueryObject(
                 dupHandle,
-                ObjectNameInformation,
+                objectNameInformation,
                 objectNameInfo,
                 returnLength,
                 NULL
-                )))
+                ) < 0)
             {
-                /* We have the type name, so just display that. */
+                // We have the type name, so just display that.
                 printf(
                     "[%#x] %.*S: (could not get name)\n",
                     handle.Handle,
@@ -253,13 +332,13 @@ int wmain(int argc, WCHAR * argv[])
             }
         }
 
-        /* Cast our buffer into an UNICODE_STRING. */
+        // Cast our buffer into an UNICODE_STRING.
         objectName = * objectNameInfo.To<PUNICODE_STRING>();
 
-        /* Print the information! */
+        // Print the information!
         if (objectName.Length)
         {
-            /* The object has a name. */
+            // The object has a name.
             printf(
                 "[%#x] %.*S: %.*S\n",
                 handle.Handle,
@@ -271,7 +350,7 @@ int wmain(int argc, WCHAR * argv[])
         }
         else
         {
-            /* Print something else. */
+            // Print something else.
             printf(
                 "[%#x] %.*S: (unnamed)\n",
                 handle.Handle,
